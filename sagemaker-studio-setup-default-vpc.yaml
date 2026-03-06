@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'SageMaker Studio Domain with User Profile and JupyterLab Space - Using Default VPC (Quick Setup)'
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: 'sagemaker-studio-domain'
+    Description: Name for the SageMaker Studio Domain
+  
+  UserProfileName:
+    Type: String
+    Default: 'default-user'
+    Description: Name for the default user profile
+  
+  SpaceName:
+    Type: String
+    Default: 'default-jupyterlab-space'
+    Description: Name for the JupyterLab space
+
+Resources:
+  # Lambda Execution Role (created first)
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Workshop Lambda role - EC2 DescribeVpcs and DescribeSubnets require wildcard resource as they don't support resource-level permissions"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: EC2ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:DescribeSubnets'
+                Resource: '*'
+
+  # Lambda Function to Lookup Default VPC
+  DefaultVPCLookupFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: "Workshop Lambda function - concurrent execution limit not needed for infrequent VPC lookup operations during stack creation/deletion"
+          - id: CKV_AWS_116
+            comment: "Workshop Lambda function - DLQ not required for synchronous custom resource that returns immediate success/failure to CloudFormation"
+          - id: CKV_AWS_117
+            comment: "Workshop Lambda function - VPC configuration not needed as function only calls EC2 API to describe VPCs and subnets, no VPC resources accessed"
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Workshop Lambda function - VPC configuration not needed as function only calls EC2 API to describe VPCs and subnets"
+          - id: W92
+            reason: "Workshop Lambda function - ReservedConcurrentExecutions not needed for infrequent VPC lookup operations during stack creation/deletion"
+    Properties:
+      FunctionName: !Sub '${DomainName}-default-vpc-lookup'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2')
+                  
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  # Get default VPC
+                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                  
+                  if not vpcs['Vpcs']:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                     {}, reason='No default VPC found')
+                      return
+                  
+                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+                  
+                  # Get all subnets in default VPC
+                  subnets = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])
+                  subnet_ids = [subnet['SubnetId'] for subnet in subnets['Subnets']]
+                  
+                  if not subnet_ids:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                     {}, reason='No subnets found in default VPC')
+                      return
+                  
+                  response_data = {
+                      'VpcId': vpc_id,
+                      'SubnetIds': subnet_ids
+                  }
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                 {}, reason=str(e))
+
+  # Custom Resource to Get Default VPC Info
+  DefaultVPCInfo:
+    Type: Custom::DefaultVPCInfo
+    Properties:
+      ServiceToken: !GetAtt DefaultVPCLookupFunction.Arn
+
+  # Security Group in Default VPC (created after VPC lookup)
+  StudioSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: DefaultVPCInfo
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_23
+            comment: "Workshop security group - egress rule allows all outbound traffic for SageMaker Studio to access AWS services and internet resources needed for ML workflows"
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: "Workshop security group - egress open to world required for SageMaker Studio to access AWS services, PyPI packages, and ML resources"
+          - id: W40
+            reason: "Workshop security group - IpProtocol -1 (all protocols) required for SageMaker Studio to communicate with various AWS services"
+          - id: W42
+            reason: "Workshop security group - IpProtocol -1 on ingress allows all traffic from same security group for SageMaker Studio inter-component communication"
+    Properties:
+      GroupDescription: Security group for SageMaker Studio
+      VpcId: !GetAtt DefaultVPCInfo.VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic for SageMaker Studio to access AWS services and ML resources
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-sg'
+
+  # Self-referencing ingress rule
+  StudioSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_23
+            comment: "Workshop security group - self-referencing ingress rule allows communication between SageMaker Studio components within the same security group"
+    Properties:
+      GroupId: !Ref StudioSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref StudioSecurityGroup
+      Description: Allow all traffic from same security group for SageMaker Studio inter-component communication
+
+  # IAM Execution Role for SageMaker
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Workshop IAM role - explicit name required for easy identification and reference in workshop instructions"
+    Properties:
+      RoleName: !Sub '${DomainName}-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSageMakerFullAccess'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - 'arn:aws:s3:::*'
+
+  # SageMaker Studio Domain with Default VPC
+  StudioDomain:
+    Type: AWS::SageMaker::Domain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_187
+            comment: "Workshop SageMaker domain - using AWS managed encryption keys for simplicity in workshop environment. Production deployments should use customer managed KMS keys"
+    Properties:
+      DomainName: !Ref DomainName
+      AuthMode: IAM
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+        SecurityGroups:
+          - !Ref StudioSecurityGroup
+      VpcId: !GetAtt DefaultVPCInfo.VpcId
+      SubnetIds: !GetAtt DefaultVPCInfo.SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Ref DomainName
+
+  # User Profile
+  UserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !Ref StudioDomain
+      UserProfileName: !Ref UserProfileName
+      UserSettings:
+        ExecutionRole: !GetAtt SageMakerExecutionRole.Arn
+
+  # JupyterLab Space
+  JupyterLabSpace:
+    Type: AWS::SageMaker::Space
+    DependsOn: UserProfile
+    Properties:
+      DomainId: !Ref StudioDomain
+      SpaceName: !Ref SpaceName
+      OwnershipSettings:
+        OwnerUserProfileName: !Ref UserProfileName
+      SpaceSharingSettings:
+        SharingType: Private
+      SpaceSettings:
+        AppType: JupyterLab
+        JupyterLabAppSettings:
+          DefaultResourceSpec:
+            InstanceType: ml.t3.medium
+
+Outputs:
+  DomainId:
+    Description: SageMaker Studio Domain ID
+    Value: !Ref StudioDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainId'
+
+  DomainArn:
+    Description: SageMaker Studio Domain ARN
+    Value: !GetAtt StudioDomain.DomainArn
+    Export:
+      Name: !Sub '${AWS::StackName}-DomainArn'
+
+  UserProfileArn:
+    Description: User Profile ARN
+    Value: !GetAtt UserProfile.UserProfileArn
+    Export:
+      Name: !Sub '${AWS::StackName}-UserProfileArn'
+
+  SpaceArn:
+    Description: JupyterLab Space ARN
+    Value: !GetAtt JupyterLabSpace.SpaceArn
+    Export:
+      Name: !Sub '${AWS::StackName}-SpaceArn'
+
+  StudioUrl:
+    Description: SageMaker Studio URL
+    Value: !Sub 'https://${StudioDomain}.studio.${AWS::Region}.sagemaker.aws/jupyterlab/default/lab?space=${SpaceName}'
+
+  ExecutionRoleArn:
+    Description: SageMaker Execution Role ARN
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+
+  DefaultVpcId:
+    Description: Default VPC ID used for SageMaker Studio
+    Value: !GetAtt DefaultVPCInfo.VpcId
+
+  DefaultSubnetIds:
+    Description: Default VPC Subnet IDs used for SageMaker Studio
+    Value: !Join [', ', !GetAtt DefaultVPCInfo.SubnetIds]
